@@ -1,0 +1,270 @@
+From 9392b7d7dda8516b02b83b4ef387524549636dea Mon Sep 17 00:00:00 2001
+From: "Francesco \"Dil3mm4\" Manzo" <dil3mm4.dev@gmail.com>
+Date: Sat, 7 Nov 2026 10:31:02 +0100
+Subject: [PATCH] Add per-title virtual clock with restart and continuous modes
+
+Expose a per-title monotonic-progressing wall clock for Mac app builds. Keep steady-clock APIs and legacy DM_FIXED_TIME behavior intact. The launcher stores mode, start date and session anchor in the existing player env.txt.
+
+Upstream-Status: fork-only
+
+Reason: Experimental per-game time override pending macOS build and game validation
+
+Issue: Local Pegasus experiment (no issue filed)
+---
+ dm/host/hle_time.c       | 73 +++++++++++++++++++++++++++++++++++++---
+ dm/host/main.c           |  2 +-
+ dm/host/tests/Makefile   |  8 ++++-
+ dm/host/tests/t_vclock.c | 47 ++++++++++++++++++++++++++
+ dm/mac/pack_app.py       |  2 +-
+ docs/env_switches.tsv    |  3 ++
+ 6 files changed, 128 insertions(+), 7 deletions(-)
+ create mode 100644 dm/host/tests/t_vclock.c
+
+diff --git a/dm/host/hle_time.c b/dm/host/hle_time.c
+index f88d64b..634fa7d 100644
+--- a/dm/host/hle_time.c
++++ b/dm/host/hle_time.c
+@@ -2,6 +2,7 @@
+ // Layout follows the public Horizon ABI: PosixTime = int64 seconds; CalendarTime = {s16 year, s8 month/day/hour/minute/second};
+ // CalendarAdditionalInfo = {u32 day of week, u32 day of year, char time zone name[8], u32 DST, s32 UTC offset in seconds}.
+ #include "hle.h"
++#include <errno.h>
+ #include <stdatomic.h>
+ #include <time.h>
+ 
+@@ -15,6 +16,67 @@ static int64_t fixed_time(void) {
+                    if (v >= 0) LOG("DM_FIXED_TIME=%lld: the user clock returns a fixed value", (long long)v); }
+     return v;
+ }
++
++// A game's wall clock can be moved without changing its steady clock or touching the Mac's clock.
++// The launcher writes these per-title env.txt values:
++// DM_VCLOCK_MODE=off|restart|continue, DM_VCLOCK_START=<Unix seconds>, DM_VCLOCK_ANCHOR=<Unix seconds>.
++// Restart starts at START on each launch. Continue adds real-world time since ANCHOR to START, including time spent closed.
++// Once launched, both modes advance with CLOCK_MONOTONIC (not the system wall clock), so an OS clock adjustment cannot jump gameplay.
++typedef struct { int mode, explicit_off; int64_t base; uint64_t mono_ns; } dm_virtual_clock_state;
++static dm_virtual_clock_state g_vclock;
++static pthread_once_t g_vclock_once = PTHREAD_ONCE_INIT;
++static int parse_vclock_epoch(const char *s, int64_t *out) {
++    if (!s || !*s) return 0;
++    errno = 0;
++    char *end; long long value = strtoll(s, &end, 10);
++    if (errno || end == s || *end || value < 0 || value > 253402300799LL) return 0; // 1970..9999
++    *out = value;
++    return 1;
++}
++static void init_vclock(void) {
++    const char *mode = getenv("DM_VCLOCK_MODE");
++    if (!mode || !*mode) return;  // legacy DM_FIXED_TIME still works
++    g_vclock.explicit_off = 1;   // an explicit Off overrides a packed DM_FIXED_TIME
++    if (!strcmp(mode, "off")) return;
++    int kind = !strcmp(mode, "restart") ? 1 : !strcmp(mode, "continue") ? 2 : 0;
++    int64_t start, anchor = 0;
++    if (!kind || !parse_vclock_epoch(getenv("DM_VCLOCK_START"), &start) ||
++        (kind == 2 && !parse_vclock_epoch(getenv("DM_VCLOCK_ANCHOR"), &anchor))) {
++        LOG("[RED] time: invalid virtual clock configuration; using real time");
++        return;
++    }
++    int64_t elapsed = 0;
++    if (kind == 2) {
++        elapsed = (int64_t)time(NULL) - anchor;
++        if (elapsed < 0) elapsed = 0;  // do not run backwards after a host clock adjustment
++    }
++    g_vclock.base = start + elapsed;
++    g_vclock.mono_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++    g_vclock.mode = kind;
++    LOG("time: simulated clock %s, starting at Unix %lld", kind == 1 ? "restart" : "continue",
++        (long long)g_vclock.base);
++}
++static int vclock_read(int64_t *sec, int64_t *nsec) {
++    pthread_once(&g_vclock_once, init_vclock);
++    if (g_vclock.mode) {
++        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++        uint64_t elapsed = now >= g_vclock.mono_ns ? now - g_vclock.mono_ns : 0;
++        *sec = g_vclock.base + (int64_t)(elapsed / 1000000000ull);
++        *nsec = (int64_t)(elapsed % 1000000000ull);
++        return 1;
++    }
++    if (g_vclock.explicit_off) {
++        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
++        *sec = now.tv_sec; *nsec = now.tv_nsec;
++        return 1;
++    }
++    return 0;
++}
++static int vclock_context_is_stable(void) {
++    pthread_once(&g_vclock_once, init_vclock);
++    return g_vclock.mode || (!g_vclock.explicit_off && fixed_time() >= 0);
++}
++
+ HLE_FORCE("_ZN2nn4time10InitializeEv", "connect to the time service; clocks come from the host system time instead", Result, h_time_Initialize, void) { return RES_OK; }
+ HLE_FORCE("_ZN2nn4time13IsInitializedEv", "the time service is taken over, always initialized", int, h_time_IsInitialized, void) { return 1; }
+ // Steady clock (seconds since boot + a clock source ID, a 16-byte UUID): the host's monotonic seconds with a fixed source ID. GetSpanBetween runs as is in sdk: it subtracts only when the source IDs match
+@@ -23,7 +85,9 @@ HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyCl
+     memcpy(out, &s, 8); memcpy(out + 8, "dmhost-steady-01", 16); return RES_OK;
+ }
+ HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }
+-HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "user clock → host time()", Result, h_time_GetCurrentTime, int64_t *out) {
++HLE_FORCE("_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", "user clock → per-game virtual clock or host time()", Result, h_time_GetCurrentTime, int64_t *out) {
++    int64_t nsec;
++    if (vclock_read(out, &nsec)) return RES_OK;
+     int64_t ft = fixed_time(); *out = ft >= 0 ? ft : time(NULL); return RES_OK;
+ }
+ // The adjustable user clock (Animal Crossing: New Horizons 3.0.3, whose days follow it): the SDK keeps it in a MonotonicSystemClock that Adjust sets from the user clock's context, and its
+@@ -34,6 +98,7 @@ HLE_FORCE("_ZN2nn4time25AdjustableUserSystemClock14GetCurrentTimeEPNS0_9PosixTim
+ // 2 = the adjustable one; 0, the system tick, before that), and std::chrono::system_clock::now() throws on its failure. The SDK's getters ask the time service: Ace Attorney Investigations
+ // Collection called std::terminate at its first real-time read, right after the first-boot language dialog (main+0x3f3f68; found by armyja, GitHub issue #18). The host user clock, to the nanosecond
+ static int h_time_timespec(int64_t *ts) {
++    if (vclock_read(&ts[0], &ts[1])) return 0;
+     int64_t ft = fixed_time();
+     if (ft >= 0) { ts[0] = ft; ts[1] = 0; return 0; }
+     struct timespec t; clock_gettime(CLOCK_REALTIME, &t); ts[0] = t.tv_sec; ts[1] = t.tv_nsec; return 0;
+@@ -57,7 +122,7 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
+     uint8_t tp[0x18]; int64_t now; h_time_SteadyNow(tp); h_time_GetCurrentTime(&now);
+     int64_t d = now - (int64_t)(guest_ns() / 1000000000ull);
+     pthread_mutex_lock(&mu);
+-    if (!made || (fixed_time() < 0 && llabs(d - drift) > 1)) {
++    if (!made || (!vclock_context_is_stable() && llabs(d - drift) > 1)) {
+         int64_t off = now - *(const int64_t *)tp; memcpy(ctx, &off, 8); memcpy(ctx + 8, tp, 0x18);
+         if (made) LOG("time: host clock moved %+lld s against the guest ticks, new user clock context", (long long)(d - drift));
+         drift = d; made = 1;
+@@ -66,8 +131,8 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock21GetSystemClockContextEPNS0_18Sy
+     pthread_mutex_unlock(&mu);
+     return RES_OK;
+ }
+-HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host time()", int64_t, h_time_now, void) {
+-    int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
++HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → virtual or host time()", int64_t, h_time_now, void) {
++    int64_t now; h_time_GetCurrentTime(&now); return now; }
+ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time_pointINS0_17SystemClockTraitsENS3_8durationIlNS2_5ratioILl1ELl1EEEEEEE",
+           "the SDK implementation pairs with now(), taken over with it", int64_t, h_time_to_time_t, const int64_t *tp) { return *tp; }
+ HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
+diff --git a/dm/host/main.c b/dm/host/main.c
+index af89a94..8f22e35 100644
+--- a/dm/host/main.c
++++ b/dm/host/main.c
+@@ -105,7 +105,7 @@ static void host_preload(int argc, char **argv) {
+     // Time zone: the game converts absolute time to local time along two paths, both ending in the host libc -- nn::time::ToCalendarTime (hle_time.c, localtime_r) and the guest libc's
+     // localtime_r / mktime (hle_table.c wires them straight to the host). So only when the host follows the system time zone do the original game's screens (chronicle discovery time etc.) show this machine's time.
+     // Only deterministic comparison (DM_FIXED_TIME) pins it to UTC: the same replay must convert to the same calendar time on this machine (UTC+8) and on the second Mac (UTC+9)
+-    if (getenv("DM_FIXED_TIME")) setenv("TZ", "UTC", 1);
++    if (getenv("DM_FIXED_TIME") && !getenv("DM_VCLOCK_MODE")) setenv("TZ", "UTC", 1);
+     // Open file limit: the soft limit starts at 256 on iOS (and in a default macOS shell), while the game's file handles, the RomFS archives, save transactions and Metal caches share it. Raise it to 4096 (as far as the hard limit allows)
+     struct rlimit rl; if (!getrlimit(RLIMIT_NOFILE, &rl) && rl.rlim_cur < 4096) {
+         rlim_t was = rl.rlim_cur; rl.rlim_cur = rl.rlim_max < 4096 ? rl.rlim_max : 4096;
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index cac33f6..e98d38d 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -12,7 +12,7 @@ QUIET = $(if $(findstring -fsanitize,$(SAN)),,2>/dev/null)
+ GINC = $(if $(strip $(GAME)),-I../gen/$(GAME) -I../../games/$(GAME),$(error GAME is not set: make GAME=<base game title ID>: $(shell python3 ../../games/game.py list | awk -F'\t' '{printf "%s (%s)  ", $$1, $$3}')))
+ $(B)/t_fs $(B)/t_fs_case $(B)/t_fs_commit_list $(B)/t_fs_commit_list_tsan: ../romfs_image.h
+ GAME_H = ../gen/$(GAME)/game_profile.h
+-run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_input_map $(B)/t_launcher_contract $(B)/t_profile_runtime
++run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_vclock $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_input_map $(B)/t_launcher_contract $(B)/t_profile_runtime
+ 	$(B)/t_language
+ 	$(B)/t_heap_size
+ 	$(B)/t_touch
+@@ -45,6 +45,10 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
+ 	$(B)/t_net_eventfd
+ 	$(B)/t_sf
+ 	$(B)/t_time
++	$(B)/t_vclock restart
++	$(B)/t_vclock continue
++	$(B)/t_vclock off
++	$(B)/t_vclock legacy
+ 	$(B)/t_shared_font
+ 	TMPDIR="$(abspath $(B))" $(B)/t_profile_runtime
+ 	$(B)/t_system_event
+@@ -243,6 +247,8 @@ $(B)/t_haptics_apple: t_haptics_apple.m ../haptics_apple.m ../haptics_apple.h ..
+ 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -I.. -o $@ t_haptics_apple.m ../hle_haptics.c -framework Cocoa -framework GameController -framework CoreHaptics -framework IOKit
+ $(B)/t_time: t_time.c ../hle_time.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_time.c
++$(B)/t_vclock: t_vclock.c ../hle_time.c ../hle.h ../dm.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_vclock.c
+ $(B)/t_oe: t_oe.c ../hle_oe.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_oe.c ../hle_profile.c
+ $(B)/t_condvar: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
+diff --git a/dm/host/tests/t_vclock.c b/dm/host/tests/t_vclock.c
+new file mode 100644
+index 0000000..e64842d
+--- /dev/null
++++ b/dm/host/tests/t_vclock.c
+@@ -0,0 +1,47 @@
++// Each invocation checks one clock mode: pthread_once deliberately reads the env only once per game process.
++#include "../hle_time.c"
++
++uint64_t guest_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
++static int failures;
++#define CHECK(c, what) do { if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", what); } } while (0)
++
++int main(int argc, char **argv) {
++    if (argc != 2) return 2;
++    const char *mode = argv[1];
++    const int64_t start = 1700000000;
++    int64_t now = 0, ts[2] = {0};
++    setenv("DM_VCLOCK_START", "1700000000", 1);
++    if (!strcmp(mode, "continue")) {
++        char anchor[32];
++        snprintf(anchor, sizeof anchor, "%lld", (long long)time(NULL) - 3600);
++        setenv("DM_VCLOCK_ANCHOR", anchor, 1);
++        setenv("DM_VCLOCK_MODE", "continue", 1);
++        CHECK(h_time_GetCurrentTime(&now) == RES_OK, "continue clock reads");
++        CHECK(now >= start + 3599 && now <= start + 3601, "continue includes an hour spent closed");
++    } else if (!strcmp(mode, "restart")) {
++        setenv("DM_VCLOCK_MODE", "restart", 1);
++        CHECK(h_time_GetCurrentTime(&now) == RES_OK, "restart clock reads");
++        CHECK(now == start, "restart begins at chosen date");
++    } else if (!strcmp(mode, "off")) {
++        setenv("DM_FIXED_TIME", "1700000000", 1);
++        setenv("DM_VCLOCK_MODE", "off", 1);
++        CHECK(h_time_GetCurrentTime(&now) == RES_OK, "off clock reads");
++        CHECK(llabs(now - (int64_t)time(NULL)) <= 1, "explicit Off overrides legacy frozen time");
++        CHECK(g_vclock.mode == 0, "off does not create a virtual clock");
++    } else if (!strcmp(mode, "legacy")) {
++        setenv("DM_FIXED_TIME", "1700000000", 1);
++        CHECK(h_time_GetCurrentTime(&now) == RES_OK && now == start, "old fixed time remains supported");
++    } else return 2;
++
++    CHECK(h_time_timespec(ts) == 0, "timespec reports a time");
++    CHECK(llabs(ts[0] - now) <= 1, "SDK real-time path agrees with user clock");
++    if (g_vclock.mode) {
++        // Inject 5 seconds of monotonic progress, with no change to the host wall clock.
++        g_vclock.mono_ns -= 5000000000ull;
++        int64_t later = 0;
++        h_time_GetCurrentTime(&later);
++        CHECK(later >= now + 5 && later <= now + 6, "simulated time advances with monotonic elapsed time");
++    }
++    printf("virtual clock %s: %d failures\n", mode, failures);
++    return failures != 0;
++}
+diff --git a/dm/mac/pack_app.py b/dm/mac/pack_app.py
+index b506f17..d93a2e1 100755
+--- a/dm/mac/pack_app.py
++++ b/dm/mac/pack_app.py
+@@ -130,7 +130,7 @@ def info_plist(a, minos, icon):
+          'CFBundleVersion': a.version or '1.0', 'CFBundleShortVersionString': a.version or '1.0', 'CFBundlePackageType': 'APPL', 'CFBundleExecutable': EXE,
+          'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'LSArchitecturePriority': ['arm64'], 'NSHighResolutionCapable': True,
+          'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US',
+-         'DMForkPatches': fork_patches(), 'DMControllerMappings': 1}
++         'DMForkPatches': fork_patches(), 'DMControllerMappings': 1, 'DMVirtualClock': 1}
+     if icon: p['CFBundleIconFile'] = 'AppIcon'
+     if a.settings:
+         listed = json.loads(Path(a.settings).read_text(encoding='utf-8'))['settings']
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 3f37f7b..9eb79cb 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -377,6 +377,9 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
+ DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
+ DM_UI_HOLD	test	When set, keeps the controller mapping test window open for 60 seconds after its UI screenshot for manual inspection
+ DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
++DM_VCLOCK_ANCHOR	switch	`=<Unix seconds>`: for DM_VCLOCK_MODE=continue, the real-world time at which the chosen virtual start was set; elapsed time while closed counts
++DM_VCLOCK_MODE	switch	`=off|restart|continue`: per-game virtual wall clock; restart starts at DM_VCLOCK_START on every launch, continue adds real elapsed time since DM_VCLOCK_ANCHOR, off forces real time
++DM_VCLOCK_START	switch	`=<Unix seconds>`: the simulated date/time chosen for the game, advancing with monotonic elapsed time while it runs; does not change steady clocks
+ DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+ DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+ DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
+-- 
+2.49.0
+

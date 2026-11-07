@@ -66,6 +66,7 @@ struct LaunchOptionsView: View {
                         groups(settings.filter(\.isBasic), game, all: settings)
                         modsSection(game)
                         frameTimesSection(game)
+                        VirtualClockCard(game: game).id(game.titleID)
                         CloudSavesCard(game: game)
                         let advanced = settings.filter { !$0.isBasic }
                         if !advanced.isEmpty {
@@ -89,6 +90,12 @@ struct LaunchOptionsView: View {
                     .padding(.horizontal, 30).padding(.bottom, 24)
                 }
                 .onChange(of: focus.focused) { id in if let id { withAnimation(.easeInOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) } } }
+                }
+            } else if let game {
+                // Per-game options remain available even when launcher.json has no settings.
+                ScrollView {
+                    VirtualClockCard(game: game).id(game.titleID)
+                        .padding(.horizontal, 30).padding(.bottom, 24)
                 }
             } else {
                 Text(loc.t("launch.none")).font(.manrope(14)).foregroundStyle(.secondary)
