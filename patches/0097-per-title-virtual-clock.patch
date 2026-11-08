@@ -5,11 +5,11 @@ Subject: [PATCH] Add per-title virtual clock with restart and continuous modes
 
 Expose a per-title monotonic-progressing wall clock for Mac app builds. Keep steady-clock APIs and legacy DM_FIXED_TIME behavior intact. The launcher stores mode, start date and session anchor in the existing player env.txt.
 
-Upstream-Status: fork-only
+Upstream-Status: pending
 
-Reason: Experimental per-game time override pending macOS build and game validation
+Reason: Experimental per-title wall-clock override awaiting upstream coordination and real-game validation
 
-Issue: Local Pegasus experiment (no issue filed)
+Issue: pending LNPANDY/NX2Apple virtual-clock feature proposal (not yet filed)
 ---
  dm/host/hle_time.c       | 73 +++++++++++++++++++++++++++++++++++++---
  dm/host/main.c           |  2 +-
